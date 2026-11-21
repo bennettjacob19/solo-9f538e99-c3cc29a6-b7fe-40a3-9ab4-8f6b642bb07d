@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PostgreSQL 行锁演练台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>PostgreSQL 行锁演练台</h1>
+  <p class="sub">UPDATE 被行锁挂住时，找出持锁会话并安全解除本次阻塞。所有数据来自真实数据库会话。</p>
+</header>
+
+<main>
+{% if error %}<div class="banner banner-error" role="alert">{{ error }}</div>{% endif %}
+{% if message %}<div class="banner banner-ok" role="status">{{ message }}</div>{% endif %}
+
+<section class="panel actions">
+  <form method="post" action="/drill/start" class="inline">
+    <button type="submit" class="btn btn-primary">开始新一轮演练</button>
+  </form>
+  {% if snapshot and snapshot.is_active %}
+  <span class="hint">新一轮演练会先结束当前这一轮（结束其会话）。</span>
+  {% endif %}
+</section>
+
+{% if snapshot %}
+{% set s = snapshot %}
+<section class="panel" id="drill-panel"
+         data-drill-id="{{ s.id }}"
+         data-token="{{ token or '' }}"
+         data-status="{{ s.status }}">
+  <div class="panel-head">
+    <h2>第 {{ s.round }} 轮 <span class="mono small">#{{ s.id[:8] }}</span></h2>
+    <span class="status status-{{ s.status }}" id="status-badge">{{ s.status }}</span>
+  </div>
+  <p class="meta">
+    创建时间 <span class="mono">{{ s.created_at }}</span>
+    {% if s.ended_at %} · 结束时间 <span class="mono">{{ s.ended_at }}</span>{% endif %}
+    {% if s.ended_reason %} · {{ s.ended_reason }}{% endif %}
+  </p>
+  {% if s.db_error %}<div class="banner banner-error">数据库读取异常：{{ s.db_error }}</div>{% endif %}
+  {% if not s.holder_identity_matches and s.holder %}
+  <div class="banner banner-warn">当前 PID {{ s.identity.holder.pid }} 已被其他会话复用（backend_start 不一致），不视为本演练的持锁会话。</div>
+  {% endif %}
+
+  <div class="grid">
+    <article class="card card-holder">
+      <h3>持锁会话（本演练创建）</h3>
+      <dl class="kv">
+        <dt>PID</dt><dd class="mono">{{ s.identity.holder.pid if s.identity.holder.pid is not none else '—' }}</dd>
+        <dt>会话启动时间</dt><dd class="mono">{{ s.identity.holder.backend_start or '—' }}</dd>
+        <dt>应用名</dt><dd class="mono">{{ s.identity.holder.application_name }}</dd>
+        <dt>当前状态</dt><dd id="holder-state">{{ s.holder.state if s.holder else '已结束' }}</dd>
+        <dt>事务开始</dt><dd class="mono">{{ s.holder.xact_start if s.holder else '—' }}</dd>
+        <dt>等待</dt><dd>{{ (s.holder.wait_event_type ~ ' / ' ~ s.holder.wait_event) if s.holder and s.holder.wait_event else '无' }}</dd>
+        <dt>身份核对</dt>
+        <dd>{% if s.holder_identity_matches %}<span class="tag tag-ok">一致</span>{% else %}<span class="tag tag-bad">不一致 / 已不存在</span>{% endif %}</dd>
+        <dt>持锁</dt>
+        <dd>
+          {% if s.locks.holder %}
+            {% for l in s.locks.holder if l.granted %}
+              <span class="tag">{{ l.locktype }}{% if l.relation %} {{ l.relation }}{% endif %} {{ l.mode }}</span>
+            {% endfor %}
+          {% else %}—{% endif %}
+        </dd>
+      </dl>
+    </article>
+
+    <article class="card card-waiter">
+      <h3>受阻更新</h3>
+      <dl class="kv">
+        <dt>PID</dt><dd class="mono">{{ s.identity.waiter.pid if s.identity.waiter.pid is not none else '—' }}</dd>
+        <dt>会话启动时间</dt><dd class="mono">{{ s.identity.waiter.backend_start or '—' }}</dd>
+        <dt>应用名</dt><dd class="mono">{{ s.identity.waiter.application_name }}</dd>
+        <dt>当前状态</dt><dd id="waiter-state">{{ s.waiter.state if s.waiter else '已结束' }}</dd>
+        <dt>等待状态</dt>
+        <dd id="waiter-wait">
+          {% if s.waiter and s.waiter.wait_event_type %}
+            <span class="tag tag-warn">{{ s.waiter.wait_event_type }} / {{ s.waiter.wait_event }}</span>
+          {% elif s.waiter %}不在等待{% else %}—{% endif %}
+        </dd>
+        <dt>实际阻塞者 PID</dt>
+        <dd id="waiter-blockers" class="mono">
+          {% if s.blockers %}{{ s.blockers | map(attribute='pid') | join(', ') }}{% else %}无{% endif %}
+        </dd>
+        <dt>阻塞关系</dt>
+        <dd id="blocking-confirmed">
+          {% if s.blocking_confirmed %}<span class="tag tag-ok">是（{{ s.identity.holder.pid }} 正在阻塞 {{ s.identity.waiter.pid }}）</span>
+          {% else %}<span class="tag tag-bad">未观察到</span>{% endif %}
+        </dd>
+        <dt>SQL</dt><dd class="sql mono">{{ (s.waiter.query if s.waiter else '') or 'UPDATE lock_drill_row …' }}</dd>
+        <dt>事务开始</dt><dd class="mono">{{ s.waiter.xact_start if s.waiter else '—' }}</dd>
+      </dl>
+    </article>
+  </div>
+
+  {% if snapshot.blockers %}
+  <div class="blockers">
+    <h4>阻塞关系明细</h4>
+    <table class="tbl">
+      <thead><tr><th>PID</th><th>应用名</th><th>用户</th><th>来源</th><th>状态</th><th>等待</th><th>会话启动时间</th></tr></thead>
+      <tbody>
+      {% for b in snapshot.blockers %}
+        <tr>
+          <td class="mono">{{ b.pid }}</td>
+          <td class="mono">{{ b.application_name or '—' }}</td>
+          <td>{{ b.usename }}</td>
+          <td class="mono">{{ b.client_addr or 'local' }}</td>
+          <td>{{ b.state }}</td>
+          <td>{{ (b.wait_event_type ~ ' / ' ~ b.wait_event) if b.wait_event else '—' }}</td>
+          <td class="mono">{{ b.backend_start }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <div class="controls">
+    {% if s.can_release %}
+    <form method="post" action="/drill/{{ s.id }}/release" class="inline"
+          onsubmit="return confirm('仅终止本演练创建的持锁会话 PID {{ s.identity.holder.pid }}。提交前会再次核对会话与阻塞关系。继续？');">
+      <input type="hidden" name="token" value="{{ token }}">
+      <button type="submit" class="btn btn-danger">解除本次阻塞（仅终止本演练的持锁会话）</button>
+    </form>
+    {% elif s.status in ('recovered', 'not_recovered') %}
+      <span class="hint">本轮已执行过解锁，不再重复终止会话。</span>
+    {% elif s.is_active %}
+      <span class="hint">等待数据库确认阻塞关系后才可解锁。</span>
+    {% endif %}
+    {% if s.can_end %}
+    <form method="post" action="/drill/{{ s.id }}/end" class="inline">
+      <input type="hidden" name="token" value="{{ token }}">
+      <button type="submit" class="btn">结束本轮演练</button>
+    </form>
+    {% endif %}
+  </div>
+
+  {% if s.release_result %}
+  {% set r = s.release_result %}
+  <section class="verdict {{ 'verdict-ok' if r.recovered else 'verdict-bad' }}" id="verdict">
+    <h3>{{ '已恢复' if r.recovered else '未恢复' }}</h3>
+    <p class="verdict-text">{{ r.verification }}</p>
+    <dl class="kv">
+      <dt>操作</dt><dd class="mono">{{ r.action }}</dd>
+      <dt>pg_terminate_backend 返回</dt><dd class="mono">{{ r.terminated }}</dd>
+      <dt>受阻更新结果</dt>
+      <dd class="mono">
+        {% if r.outcome %}{{ r.outcome.status }}{% if r.outcome.value is defined %} → value={{ r.outcome.value }}{% endif %}{% if r.outcome.error %}（{{ r.outcome.error }}）{% endif %}{% else %}无结果{% endif %}
+      </dd>
+      <dt>当前行</dt><dd class="mono">{% if r.observed_row %}value={{ r.observed_row.value }} @ {{ r.observed_row.updated_at }}{% else %}—{% endif %}</dd>
+      <dt>完成时间</dt><dd class="mono">{{ r.finished_at }}</dd>
+    </dl>
+    {% if not r.recovered %}
+      <p class="hint">终止命令返回成功不等于恢复：此处以受阻更新的真实提交结果为准。若仍有阻塞者，请按上方阻塞关系明细处理。</p>
+    {% endif %}
+  </section>
+  {% endif %}
+</section>
+{% else %}
+<section class="panel empty">
+  <p>当前没有进行中的演练。点击“开始新一轮演练”会在真实数据库中创建一个持锁事务，并在另一连接发起受阻的 UPDATE。</p>
+</section>
+{% endif %}
+
+{% if recent %}
+<section class="panel">
+  <h2>最近演练</h2>
+  <table class="tbl">
+    <thead><tr><th>轮次</th><th>创建</th><th>持锁 PID</th><th>受阻 PID</th><th>状态</th><th>判定</th><th></th></tr></thead>
+    <tbody>
+    {% for r in recent %}
+      <tr>
+        <td>#{{ r.round }} <span class="mono small">{{ r.id[:8] }}</span></td>
+        <td class="mono">{{ r.created_at }}</td>
+        <td class="mono">{{ r.identity.holder.pid or '—' }}</td>
+        <td class="mono">{{ r.identity.waiter.pid or '—' }}</td>
+        <td><span class="status status-{{ r.status }}">{{ r.status }}</span></td>
+        <td>{% if r.release_result %}{{ '已恢复' if r.release_result.recovered else '未恢复' }}{% else %}—{% endif %}</td>
+        <td><a href="/drill/{{ r.id }}">查看</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

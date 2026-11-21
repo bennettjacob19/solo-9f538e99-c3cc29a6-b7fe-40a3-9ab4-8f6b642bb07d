@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: drill
+      POSTGRES_PASSWORD: drill
+      POSTGRES_DB: drill
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drill -d drill"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  web:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://drill:drill@db:5432/drill
+      DRILL_SESSION_PREFIX: lockdrill
+      BLOCK_CONFIRM_SECONDS: "8"
+      RELEASE_WAIT_SECONDS: "10"
+      DRILL_TTL_SECONDS: "1800"
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    stop_grace_period: 30s
+
+volumes:
+  pgdata:
