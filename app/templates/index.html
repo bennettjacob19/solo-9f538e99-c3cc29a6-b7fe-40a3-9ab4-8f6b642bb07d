@@ -37,10 +37,15 @@
   </div>
   <p class="meta">
     创建时间 <span class="mono">{{ s.created_at }}</span>
+    · 采样时间 <span class="mono" id="sampled-at">{{ s.sampled_at or '—' }}</span>
     {% if s.ended_at %} · 结束时间 <span class="mono">{{ s.ended_at }}</span>{% endif %}
     {% if s.ended_reason %} · {{ s.ended_reason }}{% endif %}
   </p>
-  {% if s.db_error %}<div class="banner banner-error">数据库读取异常：{{ s.db_error }}</div>{% endif %}
+  {% if s.is_active %}
+  <div class="banner banner-warn" id="observe-banner"{% if s.observation_available %} hidden{% endif %}>
+    观测不可用：{{ s.observation_note or '未知原因' }} 解除操作已禁用，等待下一次有效采样。
+  </div>
+  {% endif %}
   {% if not s.holder_identity_matches and s.holder %}
   <div class="banner banner-warn">当前 PID {{ s.identity.holder.pid }} 已被其他会话复用（backend_start 不一致），不视为本演练的持锁会话。</div>
   {% endif %}
@@ -52,7 +57,7 @@
         <dt>PID</dt><dd class="mono">{{ s.identity.holder.pid if s.identity.holder.pid is not none else '—' }}</dd>
         <dt>会话启动时间</dt><dd class="mono">{{ s.identity.holder.backend_start or '—' }}</dd>
         <dt>应用名</dt><dd class="mono">{{ s.identity.holder.application_name }}</dd>
-        <dt>当前状态</dt><dd id="holder-state">{{ s.holder.state if s.holder else '已结束' }}</dd>
+        <dt>当前状态</dt><dd id="holder-state">{% if s.holder %}{{ s.holder.state }}{% elif s.is_active and s.sampled_at is none %}采样中…{% else %}已结束{% endif %}</dd>
         <dt>事务开始</dt><dd class="mono">{{ s.holder.xact_start if s.holder else '—' }}</dd>
         <dt>等待</dt><dd>{{ (s.holder.wait_event_type ~ ' / ' ~ s.holder.wait_event) if s.holder and s.holder.wait_event else '无' }}</dd>
         <dt>身份核对</dt>
@@ -74,7 +79,7 @@
         <dt>PID</dt><dd class="mono">{{ s.identity.waiter.pid if s.identity.waiter.pid is not none else '—' }}</dd>
         <dt>会话启动时间</dt><dd class="mono">{{ s.identity.waiter.backend_start or '—' }}</dd>
         <dt>应用名</dt><dd class="mono">{{ s.identity.waiter.application_name }}</dd>
-        <dt>当前状态</dt><dd id="waiter-state">{{ s.waiter.state if s.waiter else '已结束' }}</dd>
+        <dt>当前状态</dt><dd id="waiter-state">{% if s.waiter %}{{ s.waiter.state }}{% elif s.is_active and s.sampled_at is none %}采样中…{% else %}已结束{% endif %}</dd>
         <dt>等待状态</dt>
         <dd id="waiter-wait">
           {% if s.waiter and s.waiter.wait_event_type %}
@@ -119,12 +124,13 @@
   {% endif %}
 
   <div class="controls">
-    {% if s.can_release %}
+    {% if s.status == 'blocked' %}
     <form method="post" action="/drill/{{ s.id }}/release" class="inline"
           onsubmit="return confirm('仅终止本演练创建的持锁会话 PID {{ s.identity.holder.pid }}。提交前会再次核对会话与阻塞关系。继续？');">
       <input type="hidden" name="token" value="{{ token }}">
-      <button type="submit" class="btn btn-danger">解除本次阻塞（仅终止本演练的持锁会话）</button>
+      <button type="submit" id="release-button" class="btn btn-danger"{% if not s.can_release %} disabled{% endif %}>解除本次阻塞（仅终止本演练的持锁会话）</button>
     </form>
+    <span class="hint" id="release-hint"{% if not s.release_hint %} hidden{% endif %}>{{ s.release_hint or '' }}</span>
     {% elif s.status in ('recovered', 'not_recovered') %}
       <span class="hint">本轮已执行过解锁，不再重复终止会话。</span>
     {% elif s.is_active %}

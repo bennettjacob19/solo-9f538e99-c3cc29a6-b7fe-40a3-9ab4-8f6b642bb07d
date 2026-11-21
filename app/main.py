@@ -97,7 +97,8 @@ def _render(
         # The page token is bound to this drill round; old pages carry old
         # tokens and are rejected by the server.
         "token": drill.token if drill is not None else None,
-        "recent": [store.snapshot(item) for item in store.recent()],
+        # Round records only: the recent list never triggers database reads.
+        "recent": [store.summary(item) for item in store.recent()],
         "message": message,
         "error": error,
     }
@@ -165,7 +166,7 @@ async def api_state(drill_id: str | None = None) -> JSONResponse:
             "ok": True,
             "active_drill_id": active.id if active else None,
             "drill": store.snapshot(drill) if drill is not None else None,
-            "recent": [store.snapshot(item) for item in store.recent()],
+            "recent": [store.summary(item) for item in store.recent()],
         }
     )
 

@@ -39,6 +39,14 @@ class Settings:
     refused_wait_seconds: float
     # Abandoned active drills are cleaned up after this many seconds.
     drill_ttl_seconds: float
+    # Observation sampling (shared by every page watching the same round):
+    # two samples of one round start at least this many seconds apart.
+    sample_min_interval_seconds: float
+    # A sample older than this makes the observation "unavailable".
+    sample_stale_seconds: float
+    # A sample still running after this is abandoned (a new one may start);
+    # it also bounds each sampling statement on the database side.
+    sample_timeout_seconds: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -52,6 +60,9 @@ class Settings:
             release_wait_seconds=_float_env("RELEASE_WAIT_SECONDS", 10.0),
             refused_wait_seconds=_float_env("REFUSED_WAIT_SECONDS", 2.0),
             drill_ttl_seconds=_float_env("DRILL_TTL_SECONDS", 1800.0),
+            sample_min_interval_seconds=_float_env("SAMPLE_MIN_INTERVAL_SECONDS", 1.0),
+            sample_stale_seconds=_float_env("SAMPLE_STALE_SECONDS", 2.0),
+            sample_timeout_seconds=_float_env("SAMPLE_TIMEOUT_SECONDS", 5.0),
         )
 
 

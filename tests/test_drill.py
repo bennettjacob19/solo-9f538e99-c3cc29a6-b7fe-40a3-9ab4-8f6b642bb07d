@@ -13,6 +13,7 @@ import importlib
 import os
 import re
 import sys
+import threading
 import time
 
 import psycopg
@@ -82,6 +83,18 @@ def _state(client, drill_id: str) -> dict:
     return client.get(f"/api/state?drill_id={drill_id}").json()["drill"]
 
 
+def _wait_observation(client, drill_id: str, timeout: float = 8.0) -> dict:
+    """Poll the state API until a fresh, successful sample is available."""
+    deadline = time.time() + timeout
+    snap = None
+    while time.time() < deadline:
+        snap = _state(client, drill_id)
+        if snap["observation_available"]:
+            return snap
+        time.sleep(0.2)
+    raise AssertionError(f"observation never became available: {snap}")
+
+
 def _token(client, drill_id: str) -> str:
     html = client.get(f"/drill/{drill_id}").text
     return re.search(r'name="token" value="([^"]+)"', html).group(1)
@@ -102,10 +115,14 @@ def _sessions(drill_id: str) -> list[tuple[str, str]]:
 def test_blocking_relation_is_real_and_release_recovers(web):
     client, store = web
     drill_id = _start(client)
-    snap = _state(client, drill_id)
+    snap = _wait_observation(client, drill_id)
 
     assert snap["status"] == "blocked"
     assert snap["blocking_confirmed"] is True
+    assert snap["observation_available"] is True
+    assert snap["can_release"] is True
+    assert snap["release_hint"] is None
+    assert snap["sampled_at"]
     holder_pid = snap["identity"]["holder"]["pid"]
     assert [b["pid"] for b in snap["blockers"]] == [holder_pid]
     assert snap["waiter"]["wait_event_type"] == "Lock"
@@ -306,4 +323,206 @@ def test_release_is_idempotent(web):
     assert first.status_code == second.status_code == 200
     assert first.json()["release"] == second.json()["release"]
     assert _sessions(drill_id) == []
+    store.shutdown()
+
+
+def test_sampling_is_shared_and_rate_limited(web):
+    """Twenty tabs polling at once share one sample; two samples of the same
+    round start at least one second apart."""
+    client, store = web
+    drill_id = _start(client)
+    snap = _wait_observation(client, drill_id)
+    first = snap["sampled_at"]
+    assert first
+
+    for _ in range(20):
+        assert _state(client, drill_id)["sampled_at"] == first
+    drill = store.require(drill_id)
+    assert drill.sample_seq == 1
+
+    # After the minimum interval, the next request refreshes the shared sample.
+    time.sleep(1.1)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        snap = _state(client, drill_id)
+        if snap["sampled_at"] != first:
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("no new sample started after the minimum interval")
+    assert drill.sample_seq == 2
+    store.shutdown()
+
+
+def test_recent_list_uses_round_records_only(web, monkeypatch):
+    import app.drill as drill_mod
+
+    client, store = web
+    first = _start(client)
+    _wait_observation(client, first)
+    token = _token(client, first)
+    assert (
+        client.post(f"/api/drills/{first}/end", data={"token": token}).status_code
+        == 200
+    )
+    second = _start(client)
+    _wait_observation(client, second)
+
+    recent = client.get("/api/state").json()["recent"]
+    assert [item["id"] for item in recent][:2] == [second, first]
+    for item in recent:
+        # A round record only: no per-round database sampling fields.
+        assert "row" not in item
+        assert "locks" not in item
+        assert "blockers" not in item
+        assert item["identity"]["holder"]["pid"] is not None
+
+    # Even with database reads failing, the home page (recent list) renders.
+    def boom():
+        raise RuntimeError("simulated database outage")
+
+    monkeypatch.setattr(drill_mod, "_admin", boom)
+    res = client.get("/")
+    assert res.status_code == 200
+    assert "最近演练" in res.text
+    store.shutdown()
+
+
+def test_stale_sample_disables_release_and_fresh_sample_reenables(web):
+    client, store = web
+    drill_id = _start(client)
+    snap = _wait_observation(client, drill_id)
+    assert snap["can_release"] is True
+    drill = store.require(drill_id)
+
+    # Make the cached sample old, as if refreshes stopped arriving, and keep
+    # the next snapshot from starting a new sample just yet.
+    with drill.lock:
+        drill.sample_mono -= 60
+        drill.last_sample_start = time.monotonic()
+    stale = _state(client, drill_id)
+    assert stale["observation_available"] is False
+    assert stale["can_release"] is False
+    assert "观测不可用" in stale["release_hint"]
+
+    # The round is still blocked: a fresh valid sample re-opens the release.
+    fresh = _wait_observation(client, drill_id)
+    assert fresh["blocking_confirmed"] is True
+    assert fresh["can_release"] is True
+    store.shutdown()
+
+
+def test_failed_sampling_marks_observation_unavailable(web, monkeypatch):
+    import app.drill as drill_mod
+
+    client, store = web
+    drill_id = _start(client)
+    assert _wait_observation(client, drill_id)["can_release"] is True
+
+    def boom():
+        raise RuntimeError("simulated database outage")
+
+    monkeypatch.setattr(drill_mod, "_admin", boom)
+    deadline = time.time() + 8
+    snap = None
+    while time.time() < deadline:
+        snap = _state(client, drill_id)
+        if snap["db_error"]:
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError("failing sample never surfaced")
+    assert snap["observation_available"] is False
+    assert snap["can_release"] is False
+    assert "观测不可用" in snap["release_hint"]
+
+    # Once reads work again, a fresh valid sample re-enables the release.
+    monkeypatch.undo()
+    snap = _wait_observation(client, drill_id)
+    assert snap["can_release"] is True
+    store.shutdown()
+
+
+def test_late_sample_never_overwrites_ended_round(web):
+    import app.drill as drill_mod
+
+    client, store = web
+    drill_id = _start(client)
+    _wait_observation(client, drill_id)
+    drill = store.require(drill_id)
+    token = _token(client, drill_id)
+
+    # A reading collected just before the end arrives only afterwards.
+    late = drill_mod._collect_sample(drill)
+    assert late["db_error"] is None
+    assert (
+        client.post(f"/api/drills/{drill_id}/end", data={"token": token}).status_code
+        == 200
+    )
+    with drill.lock:
+        seq = drill.sample_seq
+        before = drill.sample["sampled_at"] if drill.sample else None
+    drill_mod._store_sample(drill, seq, late, time.monotonic())
+    with drill.lock:
+        after = drill.sample["sampled_at"] if drill.sample else None
+    assert after == before  # discarded: the ended round was not overwritten
+
+    # Nothing leaks into the next round either: it starts with an empty cache.
+    new_id = _start(client)
+    new_drill = store.require(new_id)
+    assert new_drill.sample is not late
+    store.shutdown()
+
+
+def test_stuck_sample_does_not_block_end_or_next_round(web, monkeypatch):
+    import app.drill as drill_mod
+
+    client, store = web
+    drill_id = _start(client)
+    _wait_observation(client, drill_id)
+    token = _token(client, drill_id)
+    drill = store.require(drill_id)
+
+    real_collect = drill_mod._collect_sample
+    entered = threading.Event()
+
+    def slow_collect(stuck):
+        entered.set()
+        time.sleep(6)
+        return real_collect(stuck)
+
+    monkeypatch.setattr(drill_mod, "_collect_sample", slow_collect)
+    with drill.lock:
+        drill.last_sample_start = 0.0  # force the next sample to start now
+    store.snapshot(drill)  # kicks the stuck sample
+    assert entered.wait(timeout=5)
+    with drill.lock:
+        assert drill.sample_inflight_since is not None
+    # The next round must sample fast again; the stuck one keeps sleeping.
+    monkeypatch.setattr(drill_mod, "_collect_sample", real_collect)
+
+    started = time.monotonic()
+    assert (
+        client.post(f"/api/drills/{drill_id}/end", data={"token": token}).status_code
+        == 200
+    )
+    new_id = _start(client)
+    elapsed = time.monotonic() - started
+    assert elapsed < 4.0  # neither end nor start waited for the 6s sample
+
+    snap = _wait_observation(client, new_id)
+    assert snap["status"] == "blocked"
+    assert snap["observation_available"] is True
+    store.shutdown()
+
+
+def test_drill_page_shows_sampling_time(web):
+    client, store = web
+    drill_id = _start(client)
+    _wait_observation(client, drill_id)
+    html = client.get(f"/drill/{drill_id}").text
+    assert "采样时间" in html
+    match = re.search(r'id="sampled-at">([^<]+)<', html)
+    assert match is not None
+    assert match.group(1) != "—"
     store.shutdown()

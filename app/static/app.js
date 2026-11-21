@@ -15,10 +15,11 @@
   }
 
   function render(drill) {
+    const noSample = !drill.sampled_at;
     const holder = drill.holder;
     const waiter = drill.waiter;
-    setText("holder-state", holder ? holder.state : "已结束");
-    setText("waiter-state", waiter ? waiter.state : "已结束");
+    setText("holder-state", holder ? holder.state : noSample ? "采样中…" : "已结束");
+    setText("waiter-state", waiter ? waiter.state : noSample ? "采样中…" : "已结束");
 
     const waitEl = document.getElementById("waiter-wait");
     if (waitEl) {
@@ -56,6 +57,33 @@
     if (badge) {
       badge.className = "status status-" + drill.status;
       badge.textContent = drill.status;
+    }
+
+    setText("sampled-at", drill.sampled_at || "—");
+
+    // Observation health drives whether the release action is offered.
+    const banner = document.getElementById("observe-banner");
+    if (banner) {
+      if (drill.observation_available) {
+        banner.hidden = true;
+      } else {
+        banner.hidden = false;
+        banner.textContent =
+          "观测不可用：" + (drill.observation_note || "未知原因") +
+          " 解除操作已禁用，等待下一次有效采样。";
+      }
+    }
+
+    const releaseBtn = document.getElementById("release-button");
+    if (releaseBtn) releaseBtn.disabled = !drill.can_release;
+    const releaseHint = document.getElementById("release-hint");
+    if (releaseHint) {
+      if (drill.can_release || !drill.release_hint) {
+        releaseHint.hidden = true;
+      } else {
+        releaseHint.hidden = false;
+        releaseHint.textContent = drill.release_hint;
+      }
     }
   }
 

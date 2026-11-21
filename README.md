@@ -10,9 +10,15 @@
   - 受阻更新：另一连接执行 `UPDATE lock_drill_row …`，被行锁挂住。
 - **页面展示**：两端 PID、`backend_start`（会话启动时间）、事务开始时间、当前状态、
   `wait_event_type/wait_event`、`pg_blocking_pids()` 给出的**实际阻塞者**、
-  双方持有的锁及阻塞关系明细表。
+  双方持有的锁及阻塞关系明细表，并显示本次**采样时间**。
+- **共享采样**：会话、阻塞者、锁与行值的读取由后台采样完成，同一轮演练的所有页面
+  共用结果，同轮两次采样至少间隔 `SAMPLE_MIN_INTERVAL_SECONDS` 秒；最近演练列表只读
+  轮次记录，不逐轮查库。采样在后台线程进行——一次采样卡住时，结束本轮与开启下一轮
+  都不会等它，迟到的读数会被丢弃，绝不会覆盖已结束的轮次或混入下一轮。
+- **观测可用性**：读取失败或样本超过 `SAMPLE_STALE_SECONDS` 秒时，页面提示
+  「观测不可用」并禁用解除按钮；本轮仍处于阻塞状态时，读到有效的阻塞关系便自动重新开放。
 - **安全解除**
-  - 只在「当前演练状态为 blocked，且数据库刚确认 `holder_pid ∈ pg_blocking_pids(waiter_pid)`」
+  - 只在「当前演练状态为 blocked，且最新有效样本确认 `holder_pid ∈ pg_blocking_pids(waiter_pid)`」
     时开放按钮；
   - 提交时用**单条 SQL**（`_TERMINATE_IF_STILL_BLOCKING_SQL`）原子地复核
     「原会话仍存活（pid + backend_start + 记录中的 application_name）且仍阻塞原更新」，
@@ -57,6 +63,9 @@ uvicorn app.main:app --port 8000
 | `REFUSED_WAIT_SECONDS` | `2` | 未终止时等待其自行结束的时间 |
 | `DRILL_TTL_SECONDS` | `1800` | 超时自动结束的演练时长 |
 | `DB_CONNECT_TIMEOUT` | `5` | 连接超时（秒） |
+| `SAMPLE_MIN_INTERVAL_SECONDS` | `1` | 同轮两次采样启动的最小间隔（所有页面共用采样） |
+| `SAMPLE_STALE_SECONDS` | `2` | 样本超过该时长视为观测不可用，禁用解除 |
+| `SAMPLE_TIMEOUT_SECONDS` | `5` | 采样超过该时长视为卡住，可另起新采样并丢弃迟到结果 |
 
 > 注意：生产库上使用 `pg_terminate_backend` 需要相应权限；演练请使用专用数据库/角色。
 

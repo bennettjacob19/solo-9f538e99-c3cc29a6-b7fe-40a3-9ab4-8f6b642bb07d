@@ -112,6 +112,16 @@ class Drill:
         self.ending = False
         self.lock = threading.Lock()
 
+        # Observation sampling cache.  Pages never query PostgreSQL directly:
+        # they read this cache, refreshed in the background by _maybe_sample.
+        # All fields are guarded by self.lock.
+        self.sample: dict[str, Any] | None = None
+        self.sample_mono: float = 0.0  # monotonic time when the sample started
+        self.sample_seq: int = 0
+        self.last_sample_start: float = 0.0
+        self.sample_inflight_since: float | None = None
+        self.sample_thread: threading.Thread | None = None
+
     # -- identity --------------------------------------------------------
     def holder_identity(self) -> dict[str, Any]:
         return {
@@ -302,6 +312,9 @@ class DrillStore:
                 ):
                     with drill.lock:
                         drill.status = "blocked"
+                    # Kick off the first observation sample so the freshly
+                    # redirected page usually has data on its first poll.
+                    self._maybe_sample(drill)
                     return
             time.sleep(0.05)
         raise DrillError(
@@ -555,11 +568,78 @@ class DrillStore:
             self._round = 0
 
     # -- observation -----------------------------------------------------
-    def snapshot(self, drill: Drill) -> dict[str, Any]:
-        snap: dict[str, Any] = {
+    def summary(self, drill: Drill) -> dict[str, Any]:
+        """Round-record-only view used by the recent-drills list.
+
+        Reads only the in-memory registry; it never touches PostgreSQL, so
+        rendering the list costs nothing no matter how many rounds it shows.
+        """
+        return {
             "id": drill.id,
             "round": drill.round,
             "status": drill.status,
+            "created_at": iso(drill.created_at),
+            "ended_at": iso(drill.ended_at),
+            "ended_reason": drill.ended_reason,
+            "is_active": drill.is_active(),
+            "identity": {
+                "holder": drill.holder_identity(),
+                "waiter": drill.waiter_identity(),
+            },
+            "release_result": drill.release_result,
+        }
+
+    def _maybe_sample(self, drill: Drill) -> None:
+        """Start a background sample if one is due; never blocks the caller.
+
+        All pages watching the same round share the cached sample.  Two
+        samples of one round start at least ``sample_min_interval_seconds``
+        apart, and only one runs at a time unless it outlives
+        ``sample_timeout_seconds`` (a stuck sample is then abandoned: its
+        late result is discarded by sequence number).
+        """
+        now = time.monotonic()
+        with drill.lock:
+            if drill.ending or not drill.is_active():
+                return
+            if now - drill.last_sample_start < settings.sample_min_interval_seconds:
+                return
+            inflight = drill.sample_inflight_since
+            if (
+                inflight is not None
+                and now - inflight < settings.sample_timeout_seconds
+            ):
+                return
+            drill.sample_seq += 1
+            seq = drill.sample_seq
+            drill.last_sample_start = now
+            drill.sample_inflight_since = now
+        thread = threading.Thread(
+            target=_sample_main,
+            args=(drill, seq, now),
+            name=f"drill-sample-{drill.id[:8]}-{seq}",
+            daemon=True,
+        )
+        with drill.lock:
+            drill.sample_thread = thread
+        thread.start()
+
+    def snapshot(self, drill: Drill) -> dict[str, Any]:
+        """Current view of a drill: in-memory state plus the latest sample.
+
+        This method never queries PostgreSQL itself; it only triggers a
+        background refresh when one is due.
+        """
+        self._maybe_sample(drill)
+        with drill.lock:
+            sample = drill.sample
+            sample_mono = drill.sample_mono
+            status = drill.status
+            release_result = drill.release_result
+        snap: dict[str, Any] = {
+            "id": drill.id,
+            "round": drill.round,
+            "status": status,
             "created_at": iso(drill.created_at),
             "ended_at": iso(drill.ended_at),
             "ended_reason": drill.ended_reason,
@@ -576,59 +656,38 @@ class DrillStore:
             "blockers": [],
             "locks": {"holder": [], "waiter": []},
             "row": None,
+            "db_time": None,
             "db_error": None,
-            "release_result": drill.release_result,
+            "sampled_at": None,
+            "sample_age_seconds": None,
+            "observation_available": False,
+            "observation_note": "尚未完成首次采样。",
+            "release_result": release_result,
             "waiter_outcome": drill.waiter_outcome,
-            "can_release": False,
-            "can_end": False,
         }
-        if drill.holder_pid is None:
-            return snap
-        try:
-            with _admin() as admin:
-                sessions = _read_sessions(admin, drill.holder_pid, drill.waiter_pid)
-                holder_row = sessions.get(drill.holder_pid)
-                waiter_row = sessions.get(drill.waiter_pid)
-                snap["holder_identity_matches"] = _row_matches(
-                    holder_row, drill.holder_backend_start, drill.holder_app
+        if sample is not None:
+            age = time.monotonic() - sample_mono
+            snap.update(sample)
+            snap["sample_age_seconds"] = round(age, 3)
+            if sample["db_error"] is not None:
+                snap["observation_note"] = f"数据库读取失败：{sample['db_error']}"
+            elif age > settings.sample_stale_seconds:
+                snap["observation_note"] = (
+                    f"样本已过期（{age:.1f} 秒前采样，"
+                    f"超过 {settings.sample_stale_seconds:g} 秒上限）"
                 )
-                snap["waiter_identity_matches"] = _row_matches(
-                    waiter_row, drill.waiter_backend_start, drill.waiter_app
-                )
-                snap["holder"] = _session_payload(holder_row)
-                snap["waiter"] = _session_payload(waiter_row)
-                blockers = (
-                    waiter_row["blocking_pids"] if waiter_row is not None else []
-                )
-                snap["blockers"] = _blockers_of(admin, drill.waiter_pid)
-                snap["blocking_confirmed"] = (
-                    drill.holder_pid in blockers
-                    and snap["holder_identity_matches"]
-                    and snap["waiter_identity_matches"]
-                )
-                snap["locks"] = {
-                    "holder": _locks_of(admin, drill.holder_pid),
-                    "waiter": _locks_of(admin, drill.waiter_pid),
-                }
-                row = admin.execute(
-                    "SELECT value, updated_at FROM lock_drill_row WHERE id = %s",
-                    (DRILL_ROW_ID,),
-                ).fetchone()
-                snap["row"] = (
-                    {"value": row["value"], "updated_at": iso(row["updated_at"])}
-                    if row
-                    else None
-                )
-                snap["db_time"] = iso(admin.execute("SELECT now() AS ts").fetchone()["ts"])
-        except Exception as exc:
-            snap["db_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                snap["observation_available"] = True
+                snap["observation_note"] = None
 
         snap["can_release"] = (
-            drill.status == "blocked"
+            status == "blocked"
+            and release_result is None
+            and snap["observation_available"]
             and snap["blocking_confirmed"]
-            and drill.release_result is None
         )
         snap["can_end"] = drill.is_active()
+        snap["release_hint"] = _release_hint(snap)
         return snap
 
 
@@ -748,6 +807,128 @@ def _session_payload(row: dict[str, Any] | None) -> dict[str, Any] | None:
     for key in ("backend_start", "xact_start", "query_start", "state_change"):
         data[key] = iso(data.get(key))
     return data
+
+
+# ---------------------------------------------------------------------------
+# Observation sampling (background, shared by all pages of the same round)
+# ---------------------------------------------------------------------------
+
+
+def _empty_sample() -> dict[str, Any]:
+    return {
+        "sampled_at": iso(utcnow()),
+        "db_time": None,
+        "db_error": None,
+        "holder": None,
+        "waiter": None,
+        "holder_identity_matches": False,
+        "waiter_identity_matches": False,
+        "blocking_confirmed": False,
+        "blockers": [],
+        "locks": {"holder": [], "waiter": []},
+        "row": None,
+    }
+
+
+def _collect_sample(drill: Drill) -> dict[str, Any]:
+    """Read sessions, blockers, locks and the drill row from PostgreSQL.
+
+    Runs in a sampler thread; never raises — failures are reported through
+    the sample's ``db_error`` field.
+    """
+    with drill.lock:
+        holder_pid = drill.holder_pid
+        waiter_pid = drill.waiter_pid
+        holder_backend_start = drill.holder_backend_start
+        waiter_backend_start = drill.waiter_backend_start
+        holder_app = drill.holder_app
+        waiter_app = drill.waiter_app
+
+    sample = _empty_sample()
+    if holder_pid is None:
+        return sample
+    try:
+        with _admin() as admin:
+            # Bound every sampling statement so a stuck read turns into a
+            # reported failure instead of hanging the sampler forever.
+            admin.execute(
+                "SET statement_timeout = "
+                f"{max(1000, int(settings.sample_timeout_seconds * 1000))}"
+            )
+            sessions = _read_sessions(admin, holder_pid, waiter_pid)
+            holder_row = sessions.get(holder_pid)
+            waiter_row = sessions.get(waiter_pid)
+            sample["holder_identity_matches"] = _row_matches(
+                holder_row, holder_backend_start, holder_app
+            )
+            sample["waiter_identity_matches"] = _row_matches(
+                waiter_row, waiter_backend_start, waiter_app
+            )
+            sample["holder"] = _session_payload(holder_row)
+            sample["waiter"] = _session_payload(waiter_row)
+            blocking = waiter_row["blocking_pids"] if waiter_row is not None else []
+            sample["blockers"] = _blockers_of(admin, waiter_pid)
+            sample["blocking_confirmed"] = (
+                holder_pid in blocking
+                and sample["holder_identity_matches"]
+                and sample["waiter_identity_matches"]
+            )
+            sample["locks"] = {
+                "holder": _locks_of(admin, holder_pid),
+                "waiter": _locks_of(admin, waiter_pid),
+            }
+            row = admin.execute(
+                "SELECT value, updated_at FROM lock_drill_row WHERE id = %s",
+                (DRILL_ROW_ID,),
+            ).fetchone()
+            sample["row"] = (
+                {"value": row["value"], "updated_at": iso(row["updated_at"])}
+                if row
+                else None
+            )
+            sample["db_time"] = iso(admin.execute("SELECT now() AS ts").fetchone()["ts"])
+    except Exception as exc:
+        sample["db_error"] = f"{type(exc).__name__}: {exc}"
+    return sample
+
+
+def _sample_main(drill: Drill, seq: int, started: float) -> None:
+    try:
+        sample = _collect_sample(drill)
+    except Exception as exc:  # _collect_sample should not raise; be safe
+        logger.exception("sampling crashed for drill %s", drill.id)
+        sample = _empty_sample()
+        sample["db_error"] = f"{type(exc).__name__}: {exc}"
+    _store_sample(drill, seq, sample, started)
+
+
+def _store_sample(drill: Drill, seq: int, sample: dict[str, Any], started: float) -> None:
+    """Publish a finished sample unless it is late.
+
+    A sample is dropped when a newer one has already started (sequence moved
+    on) or when the round ended while it was running — a late reading must
+    never overwrite an ended round, and because the cache lives on the Drill
+    object it can never leak into the next round either.
+    """
+    with drill.lock:
+        if seq != drill.sample_seq:
+            return
+        drill.sample_inflight_since = None
+        if drill.ending or drill.status in ("ended", "error"):
+            return
+        drill.sample = sample
+        drill.sample_mono = started
+
+
+def _release_hint(snap: dict[str, Any]) -> str | None:
+    """Why the release action is currently disabled (None when it is not)."""
+    if snap["status"] != "blocked" or snap["release_result"] is not None:
+        return None
+    if not snap["observation_available"]:
+        return f"观测不可用（{snap['observation_note']}），暂不能解除。"
+    if not snap["blocking_confirmed"]:
+        return "尚未观察到有效的阻塞关系，暂不能解除。"
+    return None
 
 
 # ---------------------------------------------------------------------------
